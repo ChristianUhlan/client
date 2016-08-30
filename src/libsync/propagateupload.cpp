@@ -28,6 +28,8 @@
 
 #include <json.h>
 #include <QNetworkAccessManager>
+#include <QHttpMultiPart>
+#include <QJsonDocument>
 #include <QFileInfo>
 #include <QDir>
 #include <cmath>
@@ -894,5 +896,192 @@ void PropagateUploadFileQNAM::abortWithError(SyncFileItem::Status status, const 
     done(status, error);
 }
 
+void PropagateUploadBundleQNAM::start()
+{
+    _propagator->_activeJobList.append(this);
+    QHttpMultiPart *multiPart = new QHttpMultiPart(QHttpMultiPart::RelatedType);
+    multiPart->setBoundary("boundrary123");
+
+    quint64 contentID = 0;
+    QJsonDocument doc(_bundledFilesMetadata);
+    QByteArray bundledFilesMetadataString(doc.toJson(QJsonDocument::Compact));
+    QHttpPart bundleContentMetadata;
+    bundleContentMetadata.setHeader(QNetworkRequest::ContentLengthHeader, QVariant(bundledFilesMetadataString.size()));
+    bundleContentMetadata.setHeader(QNetworkRequest::ContentTypeHeader, QVariant("application/json; charset=UTF-8"));
+    bundleContentMetadata.setRawHeader("Content-ID", QByteArray::number(contentID));
+    bundleContentMetadata.setBody(bundledFilesMetadataString);
+    multiPart->append(bundleContentMetadata);
+
+    foreach(auto item, _bundledFiles) {
+        if (_propagator->_abortRequested.fetchAndAddRelaxed(0)) {
+            return;
+        }
+
+        const QString fullFilePath = _propagator->getFilePath(item->_file);
+
+        if (!FileSystem::fileExists(fullFilePath)) {
+            //TODO: create an array of responses for each item
+            done(SyncFileItem::SoftError, tr("File Removed"));
+            return;
+        }
+
+        time_t prevModtime = item->_modtime; // the _item value was set in PropagateUploadFileQNAM::start()
+        // but a potential checksum calculation could have taken some time during which the file could
+        // have been changed again, so better check again here.
+
+        item->_modtime = FileSystem::getModTime(fullFilePath);
+        if( prevModtime != item->_modtime ) {
+            _propagator->_anotherSyncNeeded = true;
+            //TODO: create an array of responses for each item
+            done(SyncFileItem::SoftError, tr("Local file changed during syncing. It will be resumed."));
+            return;
+        }
+
+        quint64 fileSize = FileSystem::getSize(fullFilePath);
+        item->_size = fileSize;
+
+        // But skip the file if the mtime is too close to 'now'!
+        // That usually indicates a file that is still being changed
+        // or not yet fully copied to the destination.
+        if (fileIsStillChanging(*item)) {
+            _propagator->_anotherSyncNeeded = true;
+            done(SyncFileItem::SoftError, tr("Local file changed during sync."));
+            return;
+        }
+
+        QHttpPart bundleContent;
+        bundleContent.setHeader(QNetworkRequest::ContentLengthHeader, QVariant(fileSize));
+        contentID++;
+        bundleContent.setRawHeader("Content-ID", QByteArray::number(contentID));
+        bundleContent.setRawHeader("X-OC-Mtime", QByteArray::number(qint64(item->_modtime)));
+        if(item->_file.contains(".sys.admin#recall#")) {
+            // This is a file recall triggered by the admin.  Note: the
+            // recall list file created by the admin and downloaded by the
+            // client (.sys.admin#recall#) also falls into this category
+            // (albeit users are not supposed to mess up with it)
+
+            // We use a special tag header so that the server may decide to store this file away in some admin stage area
+            // And not directly in the user's area (which would trigger redownloads etc).
+            bundleContent.setRawHeader("OC-Tag", QByteArray(".sys.admin#recall#"));
+        }
+
+        //TODO use Upload debive to support bandwith limitation on the client
+        QFile *file = new QFile(fullFilePath);
+        if (! file->open(QIODevice::ReadOnly)) {
+            qDebug() << "ERR: Could not prepare upload device";
+
+            // If the file is currently locked, we want to retry the sync
+            // when it becomes available again.
+            if (FileSystem::isFileLocked(fullFilePath)) {
+                emit _propagator->seenLockedFile(fullFilePath);
+            }
+
+            // Soft error because this is likely caused by the user modifying his files while syncing
+            abortWithError( SyncFileItem::SoftError, "ERR: Could not prepare upload device" );
+            delete file;
+            return;
+        }
+        bundleContent.setBodyDevice(file);
+        file->setParent(multiPart);
+        multiPart->append(bundleContent);
+    }
+
+    const QString userPath = _propagator->account()->davFilesPath();
+
+    // job takes ownership of device via a QScopedPointer. Job deletes itself when finishing
+    MultipartJob* job = new MultipartJob(_propagator->account(), userPath, multiPart);
+
+    //_jobs.append(job);
+    connect(job, SIGNAL(finishedSignal()), this, SLOT(slotPutFinished()));
+    //connect(job, SIGNAL(uploadProgress(qint64,qint64)), this, SLOT(slotUploadProgress(qint64,qint64)));
+    //connect(job, SIGNAL(uploadProgress(qint64,qint64)), device, SLOT(slotJobUploadProgress(qint64,qint64)));
+    connect(job, SIGNAL(destroyed(QObject*)), this, SLOT(slotJobDestroyed(QObject*)));
+    job->start();
+    _propagator->_activeJobList.append(this);
+}
+
+void PropagateUploadBundleQNAM::slotPutFinished()
+{
+    //TODO
+    _propagator->_activeJobList.removeOne(this);
+    done(SyncFileItem::Success);
+}
+
+void PropagateUploadBundleQNAM::finalize(const SyncFileItem &copy)
+{
+    //TODO
+}
+
+void PropagateUploadBundleQNAM::slotJobDestroyed(QObject* job)
+{
+    _jobs.erase(std::remove(_jobs.begin(), _jobs.end(), job) , _jobs.end());
+}
+
+void PropagateUploadBundleQNAM::abort()
+{
+    foreach(auto *job, _jobs) {
+        if (job->reply()) {
+            qDebug() << Q_FUNC_INFO << job << this->_item->_file;
+            job->reply()->abort();
+        }
+    }
+}
+
+// This function is used whenever there is an error occuring and jobs might be in progress
+void PropagateUploadBundleQNAM::abortWithError(SyncFileItem::Status status, const QString &error)
+{
+    _finished = true;
+    abort();
+    done(status, error);
+}
+
+MultipartJob::~MultipartJob()
+{
+    // Make sure that we destroy the QNetworkReply before our _device of which it keeps an internal pointer.
+    setReply(0);
+}
+
+void MultipartJob::start() {
+    QNetworkRequest req;
+    //TODO remove
+    req.setRawHeader("Cookie", "XDEBUG_SESSION=MROW4A;path=/");
+    setReply(multipartRequest(path(), req, _multipart));
+    setupConnections(reply());
+
+    if( reply()->error() != QNetworkReply::NoError ) {
+        qWarning() << Q_FUNC_INFO << " Network error: " << reply()->errorString();
+    }
+
+//    connect(reply(), SIGNAL(uploadProgress(qint64,qint64)), this, SIGNAL(uploadProgress(qint64,qint64)));
+    connect(this, SIGNAL(networkActivity()), account().data(), SIGNAL(propagatorNetworkActivity()));
+
+//    // For Qt versions not including https://codereview.qt-project.org/110150
+//    // Also do the runtime check if compiled with an old Qt but running with fixed one.
+//    // (workaround disabled on windows and mac because the binaries we ship have patched qt)
+//#if QT_VERSION < QT_VERSION_CHECK(4, 8, 7)
+//    if (QLatin1String(qVersion()) < QLatin1String("4.8.7"))
+//        connect(_device.data(), SIGNAL(wasReset()), this, SLOT(slotSoftAbort()));
+//#elif QT_VERSION > QT_VERSION_CHECK(5, 0, 0) && QT_VERSION < QT_VERSION_CHECK(5, 4, 2) && !defined Q_OS_WIN && !defined Q_OS_MAC
+//    if (QLatin1String(qVersion()) < QLatin1String("5.4.2"))
+//        connect(_device.data(), SIGNAL(wasReset()), this, SLOT(slotSoftAbort()));
+//#endif
+
+    AbstractNetworkJob::start();
+}
+
+void MultipartJob::slotTimeout() {
+    qDebug() << "Timeout" << (reply() ? reply()->request().url() : path());
+    if (!reply())
+        return;
+    _errorString =  tr("Connection Timeout");
+    reply()->abort();
+}
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 4, 2)
+void MultipartJob::slotSoftAbort() {
+    reply()->setProperty(owncloudShouldSoftCancelPropertyName, true);
+    reply()->abort();
+}
+#endif
 
 }

@@ -303,6 +303,9 @@ void OwncloudPropagator::start(const SyncFileItemVector& items)
     directories.push(qMakePair(QString(), _rootJob.data()));
     QVector<PropagatorJob*> directoriesToRemove;
     QString removedDirectory;
+
+    quint64 bundleMaxFilesize = 1000 * 1000 * 1000 * 1000LL;
+    auto bundleJob = new PropagateUploadBundleQNAM(this);
     foreach(const SyncFileItemPtr &item, items) {
 
         if (!removedDirectory.isEmpty() && item->_file.startsWith(removedDirectory)) {
@@ -379,6 +382,11 @@ void OwncloudPropagator::start(const SyncFileItemVector& items)
                 currentDirJob->append(dir);
             }
             directories.push(qMakePair(item->destination() + "/" , dir));
+        } else if ((item->_instruction == CSYNC_INSTRUCTION_NEW)
+                  && (item->_direction == SyncFileItem::Up)
+                  && (item->_size < bundleMaxFilesize)) {
+            //this will create list of bundle files to sync for that bundlejob
+            bundleJob->append(item);
         } else if (PropagateItemJob* current = createJob(item)) {
             if (item->_instruction == CSYNC_INSTRUCTION_TYPE_CHANGE) {
                 // will delete directories, so defer execution
@@ -389,6 +397,10 @@ void OwncloudPropagator::start(const SyncFileItemVector& items)
             }
         }
     }
+
+    //TODO Add support for more bundled jobs if bundleJob->append fails, please refer to class declaration
+    _rootJob->append(bundleJob);
+
 
     foreach(PropagatorJob* it, directoriesToRemove) {
         _rootJob->append(it);
